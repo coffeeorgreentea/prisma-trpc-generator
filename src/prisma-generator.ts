@@ -19,6 +19,7 @@ import {
 } from './helpers';
 import { project } from './project';
 import removeDir from './utils/removeDir';
+import getRelativePath from './utils/getRelativePath';
 
 export async function generate(options: GeneratorOptions) {
   const outputDir = parseEnvValue(options.generator.output as EnvValue);
@@ -103,6 +104,7 @@ export async function generate(options: GeneratorOptions) {
           opType.replace('One', '') as DMMF.ModelAction,
         ),
     );
+
     if (!modelActions.length) continue;
 
     const plural = pluralize(model.toLowerCase());
@@ -123,11 +125,30 @@ export async function generate(options: GeneratorOptions) {
       generateRouterSchemaImports(modelRouter, model, modelActions);
     }
 
+    // Import type from @prisma/client
+    modelRouter.addImportDeclaration({
+      moduleSpecifier: '@prisma/client',
+      namedImports: [model],
+    });
+
+    // Import observable from @trpc/server/observable
+    modelRouter.addImportDeclaration({
+      moduleSpecifier: '@trpc/server/observable',
+      namedImports: ['observable'],
+    });
+
+    // Import event emitter
+    modelRouter.addImportDeclaration({
+      moduleSpecifier: `../.${config.emitterPath}`, // TODO: gross path manipulation
+      namedImports: ['ee'],
+    });
+
     modelRouter.addStatements(/* ts */ `
       export const ${plural}Router = t.router({`);
 
     for (const opType of modelActions) {
-      const opNameWithModel = operations[opType];
+      const opNameWithModel =
+        operations[opType as keyof typeof operations] || opType;
       const baseOpType = opType.replace('OrThrow', '');
 
       generateProcedure(
@@ -141,12 +162,94 @@ export async function generate(options: GeneratorOptions) {
       );
     }
 
+    // Add default subscription procedures
+    const subscriptionOperations = ['create', 'update', 'delete'];
+    for (const event of subscriptionOperations) {
+      generateProcedure(
+        modelRouter,
+        event,
+        '',
+        model,
+        `subscription:${event}`,
+        event,
+        config,
+      );
+    }
+
     modelRouter.addStatements(/* ts */ `
     })`);
 
     modelRouter.formatText({ indentSize: 2 });
     routerStatements.push(/* ts */ `
       ${model.toLowerCase()}: ${plural}Router`);
+  }
+
+  // Generate shield configuration
+  if (config.withShield) {
+    const shieldFile = project.createSourceFile(
+      path.resolve(outputDir, 'shield', 'shield.ts'),
+      undefined,
+      { overwrite: true },
+    );
+
+    shieldFile.addStatements(/* ts */ `
+    import { shield, allow } from 'trpc-shield';
+    import { Context } from '${getRelativePath(
+      outputDir,
+      config.contextPath,
+      false,
+      options.schemaPath,
+    )}';
+    `);
+
+    const shieldConfig: Record<string, Record<string, any>> = {
+      query: {},
+      mutation: {},
+      subscription: {},
+    };
+
+    for (const modelOperation of modelOperations) {
+      const { model } = modelOperation;
+
+      const operations = [
+        'aggregate',
+        'findFirst',
+        'findMany',
+        'findUnique',
+        'groupBy',
+      ];
+      operations.forEach((op) => {
+        shieldConfig.query[`${op}${model}`] = 'allow';
+      });
+
+      const mutationOperations = [
+        'createOne',
+        'deleteMany',
+        'deleteOne',
+        'updateMany',
+        'updateOne',
+        'upsertOne',
+      ];
+      mutationOperations.forEach((op) => {
+        shieldConfig.mutation[`${op}${model}`] = 'allow';
+      });
+
+      // Add subscription operations
+      const subscriptionOperations = ['create', 'update', 'delete'];
+      subscriptionOperations.forEach((op) => {
+        shieldConfig.subscription[`${op}${model}`] = 'allow';
+      });
+    }
+
+    shieldFile.addStatements(/* ts */ `
+    export const permissions = shield<Context>(${JSON.stringify(
+      shieldConfig,
+      null,
+      2,
+    ).replace(/"allow"/g, 'allow')});
+    `);
+
+    shieldFile.formatText({ indentSize: 2 });
   }
 
   appRouter.addStatements(/* ts */ `

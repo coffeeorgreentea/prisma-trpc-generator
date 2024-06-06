@@ -192,17 +192,38 @@ export function generateProcedure(
     input =
       '{ where: input.where, orderBy: input.orderBy, by: input.by, having: input.having, take: input.take, skip: input.skip }';
   }
-  sourceFile.addStatements(/* ts */ `${
-    config.showModelNameInProcedure ? name : nameWithoutModel
-  }: ${getProcedureName(config)}
-  ${config.withZod ? `.input(${typeName})` : ''}.${getProcedureTypeByOpName(
-    baseOpType,
-  )}(async ({ ctx, input }) => {
-    const ${name} = await ctx.prisma.${uncapitalizeFirstLetter(
-    modelName,
-  )}.${opType.replace('One', '')}(${input});
-    return ${name};
-  }),`);
+
+  if (opType.startsWith('subscription:')) {
+    const event = opType.split(':')[1];
+    sourceFile.addStatements(/* ts */ `
+      ${event}: ${getProcedureName(config)}.subscription(() => {
+        return observable<${modelName}>((emit) => {
+          const on${event} = (data: ${modelName}) => {
+            emit.next(data);
+          };
+          ee.on('${event}', on${event});
+          return () => {
+            ee.off('${event}', on${event});
+          };
+        });
+      }),
+    `);
+  } else {
+    sourceFile.addStatements(/* ts */ `
+      ${
+        config.showModelNameInProcedure ? name : nameWithoutModel
+      }: ${getProcedureName(config)}
+      ${config.withZod ? `.input(${typeName})` : ''}.${getProcedureTypeByOpName(
+      baseOpType,
+    )}(async ({ ctx, input }) => {
+      const ${name} = await ctx.prisma.${uncapitalizeFirstLetter(
+      modelName,
+    )}.${opType.replace('One', '')}(${input});
+      ee.emit('${opType}:${modelName}', ${name});  // Emit event with model name
+      return ${name};
+    }),
+    `);
+  }
 }
 
 export function generateRouterSchemaImports(
@@ -213,7 +234,6 @@ export function generateRouterSchemaImports(
   sourceFile.addStatements(
     /* ts */
     [
-      // remove any duplicate import statements
       ...new Set(
         modelActions.map((opName) =>
           getRouterSchemaImportByOpName(opName, modelName),
@@ -221,6 +241,25 @@ export function generateRouterSchemaImports(
       ),
     ].join('\n'),
   );
+
+  // Check if any subscription operations exist
+  if (
+    ['subscription:create', 'subscription:update', 'subscription:delete'].some(
+      (event) => modelActions.includes(event),
+    )
+  ) {
+    sourceFile.addImportDeclaration({
+      moduleSpecifier: 'events',
+      namedImports: ['EventEmitter'],
+    });
+    sourceFile.addImportDeclaration({
+      moduleSpecifier: '@trpc/server/observable',
+      namedImports: ['observable'],
+    });
+    sourceFile.addStatements(/* ts */ `
+      const ee = new EventEmitter();
+    `);
+  }
 }
 
 export const getRouterSchemaImportByOpName = (

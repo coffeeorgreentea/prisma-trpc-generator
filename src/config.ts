@@ -32,6 +32,8 @@ export const configSchema = z.object({
         .split(',')
         .map((action) => modelActionEnum.parse(action.trim()));
     }),
+  generateSubscriptions: configBoolean.default('false'),
+  emitterPath: z.string().default('../../../../src/emitter'), // Add this line
 });
 
 export type Config = z.infer<typeof configSchema>;
